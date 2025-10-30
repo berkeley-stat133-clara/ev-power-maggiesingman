@@ -1,5 +1,97 @@
 ---
 title: "EV Power Dashboard"
-format: dashboard
+format:
+  dashboard:
+    theme: cosmo
+    orientation: rows
+    navbar: []
 ---
 
+```{r}
+#| include: false
+library(tidyverse)
+library(janitor)
+library(scales)
+
+# ----------------- Utilities -----------------
+
+name_from_abbr <- function(abbr) tolower(state.name)[match(toupper(abbr), state.abb)]
+
+# Normalize a state name column to full, lowercase names ("california")
+normalize_state <- function(x) {
+  s <- tolower(stringr::str_squish(x))
+  # turn 2-letter abbr into full
+  is_ab <- nchar(s) == 2 & toupper(s) %in% state.abb
+  s[is_ab] <- name_from_abbr(s[is_ab])
+  # strip punctuation/underscores
+  s <- stringr::str_replace_all(s, "[^a-z ]", "")
+  s <- stringr::str_squish(s)
+  s
+}
+
+# Choose one numeric value column from a data.frame (not state/year/energy_source)
+choose_numeric_value <- function(df) {
+  cand <- setdiff(names(df), c("state", "year", "energy_source"))
+  # try any column with digits or "use", "price", "registr", etc.
+  strong <- cand[str_detect(cand, "2023|use|price|registr|value|total|renew")]
+  cols <- if (length(strong)) strong else cand
+  # parse candidates and pick the one with most non-NA numerics
+  best <- NULL; best_non_na <- -1
+  for (nm in cols) {
+    v <- suppressWarnings(readr::parse_number(as.character(df[[nm]])))
+    nn <- sum(is.finite(v))
+    if (nn > best_non_na) { best_non_na <- nn; best <- nm }
+  }
+  best
+}
+
+# Detect "state columns" if a file is wide (state abbreviations or full names as headers)
+choose_state_cols <- function(df) {
+  nms_raw <- names(df)
+  nms_lc  <- tolower(str_replace_all(nms_raw, "[^a-z]", ""))
+  abbrs <- tolower(state.abb)
+  full  <- tolower(state.name)
+  idx <- which(nms_lc %in% c(abbrs, full))
+  if (length(idx) == 0) idx <- which(substr(nms_lc, 1, 2) %in% abbrs)  # e.g., ak_2023
+  idx
+}
+
+# Generic reader that handles *either* long (with 'state') or wide layout.
+# value_name: name to give the numeric result column (e.g., "renew_use")
+# year_val:   numeric year to assign (default 2023)
+read_state_value <- function(path, value_name, year_val = 2023L) {
+  df <- readr::read_csv(path, show_col_types = FALSE) |> clean_names()
+
+  if ("state" %in% names(df)) {
+    # LONG layout: state column already present
+    df <- df |>
+      mutate(state = normalize_state(state))
+    val_col <- choose_numeric_value(df)
+    out <- df |>
+      transmute(state,
+                !!value_name := readr::parse_number(as.character(.data[[val_col]])),
+                year = year_val) |>
+      filter(!is.na(state))
+  } else {
+    # WIDE layout: pivot state columns
+    idx <- choose_state_cols(df)
+    if (length(idx) == 0) {
+      stop("Could not find state columns in: ", path,
+           ". Headers were: ", paste(names(df), collapse = ", "))
+    }
+    out <- df |>
+      tidyr::pivot_longer(
+        cols = all_of(names(df)[idx]),
+        names_to = "state_col", values_to = value_name
+      ) |>
+      mutate(
+        state = tolower(str_replace_all(state_col, "[^a-z]", "")),
+        state = if_else(nchar(state) == 2 & toupper(state) %in% state.abb,
+                        name_from_abbr(state), state),
+        !!value_name := readr::parse_number(as.character(.data[[value_name]]))
+      ) |>
+      transmute(state, !!value_name := .data[[value_name]], year = year_val) |>
+      filter(!is.na(state))
+  }
+  out
+}
